@@ -93,6 +93,10 @@ public final class DeltaLogSnapshot implements Comparable<DeltaLogSnapshot> {
         return netOutputRows;
     }
 
+    public void setNetOutputRows(long netOutputRows) {
+        this.netOutputRows = netOutputRows;
+    }
+
     public List<String> getPartitionColumns() {
         return partitionColumns;
     }

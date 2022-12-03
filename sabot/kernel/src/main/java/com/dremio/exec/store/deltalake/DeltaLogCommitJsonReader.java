@@ -16,11 +16,13 @@
 
 package com.dremio.exec.store.deltalake;
 
+import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_FIELD_ADD;
 import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_FIELD_COMMIT_INFO;
 import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_FIELD_METADATA;
 import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_FIELD_METADATA_PARTITION_COLS;
 import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_FIELD_METADATA_SCHEMA_STRING;
 import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_FIELD_PROTOCOL;
+import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_FIELD_REMOVE;
 import static com.dremio.exec.store.deltalake.DeltaConstants.DELTA_TIMESTAMP;
 import static com.dremio.exec.store.deltalake.DeltaConstants.OP;
 import static com.dremio.exec.store.deltalake.DeltaConstants.OP_METRICS;
@@ -86,12 +88,14 @@ public class DeltaLogCommitJsonReader implements DeltaLogReader {
              final BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(commitFileIs))) {
             /*
              * Apart from commitInfo, other sections are optional.
+             * If commitInfo doesn't contain operation metrics, FileAction stats are used instead.
              */
             DeltaLogSnapshot snapshot = new DeltaLogSnapshot();
+            DeltaLogFileActionStats fileActionStats = new DeltaLogFileActionStats(0L);
             String nextLine;
             boolean foundMetadata = false, foundCommitInfo = false;
             JsonNode metadataNode = null;
-            while (!(foundCommitInfo && foundMetadata) && (nextLine = bufferedReader.readLine())!=null) {
+            while (!(foundCommitInfo && foundMetadata && snapshot.getNetOutputRows() != 0) && (nextLine = bufferedReader.readLine())!=null) {
                 final JsonNode json = OBJECT_MAPPER.readTree(nextLine);
                 if (json.has(DELTA_FIELD_METADATA)) {
                     metadataNode = json.get(DELTA_FIELD_METADATA);
@@ -104,6 +108,8 @@ public class DeltaLogCommitJsonReader implements DeltaLogReader {
                 } else if (json.has(DELTA_FIELD_COMMIT_INFO)) {
                     snapshot = OBJECT_MAPPER.readValue(nextLine, DeltaLogSnapshot.class);
                     foundCommitInfo = true;
+                } else if (json.has(DELTA_FIELD_REMOVE) || json.has(DELTA_FIELD_ADD)) {
+                    fileActionStats = fileActionStats.merge(OBJECT_MAPPER.readValue(nextLine, DeltaLogFileActionStats.class));
                 }
             }
             if(metadataNode != null) {
@@ -111,6 +117,10 @@ public class DeltaLogCommitJsonReader implements DeltaLogReader {
             }
 
             snapshot.setSplits(generateSplits(fileAttributes.get(0), snapshot.getDataFileEntryCount(), version));
+
+            if (snapshot.getNetOutputRows() == 0) {
+              snapshot.setNetOutputRows(fileActionStats.getNetRecords());
+            }
 
             logger.debug("For file {}, snaspshot is {}", commitFilePath, snapshot.toString());
             return snapshot;
@@ -137,6 +147,7 @@ public class DeltaLogCommitJsonReader implements DeltaLogReader {
         final ObjectMapper objectMapper = new ObjectMapper();
         final SimpleModule module = new SimpleModule();
         module.addDeserializer(DeltaLogSnapshot.class, new DeltaSnapshotDeserializer());
+        module.addDeserializer(DeltaLogFileActionStats.class, new DeltaLogFileActionStatsDeserializer());
         objectMapper.registerModule(module);
         return objectMapper;
     }
@@ -193,6 +204,64 @@ public class DeltaLogCommitJsonReader implements DeltaLogReader {
             final long timestamp = get(commitInfo, 0L, asLong, DELTA_TIMESTAMP);
             return new DeltaLogSnapshot(operationType, netFilesAdded, netBytesAdded, netOutputRows, totalFileEntries, timestamp, false);
         }
+    }
+
+    private static class DeltaLogFileActionStatsDeserializer extends StdDeserializer<DeltaLogFileActionStats> {
+        public DeltaLogFileActionStatsDeserializer() {
+            this(null);
+        }
+
+        public DeltaLogFileActionStatsDeserializer(Class<?> vc) {
+            super(vc);
+        }
+
+        @Override
+        public DeltaLogFileActionStats deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+            final JsonNode fullfileActionJson = jp.getCodec().readTree(jp);
+            logger.debug("fullfileActionJson is {}", fullfileActionJson);
+            boolean isAdd = fullfileActionJson.has(DELTA_FIELD_ADD);
+            final JsonNode fileActionJson = fullfileActionJson.get(isAdd ? DELTA_FIELD_ADD : DELTA_FIELD_REMOVE);
+            final JsonNode node = findNode(fileActionJson, DeltaConstants.SCHEMA_STATS);
+
+            if (node == null) {
+              return new DeltaLogFileActionStats(null);
+            } else {
+              final JsonNode statsNode = OBJECT_MAPPER.readTree(node.asText());
+              Long numRecords = get(statsNode, null, JsonNode::asLong, DeltaConstants.STATS_PARSED_NUM_RECORDS);
+
+              if (numRecords != null) {
+                return new DeltaLogFileActionStats(numRecords * (isAdd ? 1 : -1));
+              } else {
+                return new DeltaLogFileActionStats(numRecords);
+              }
+            }
+        }
+    }
+
+    private static class DeltaLogFileActionStats {
+
+      public Long netRecords;
+
+      public DeltaLogFileActionStats(Long numRecords) {
+        this.netRecords = numRecords;
+      }
+
+      public DeltaLogFileActionStats merge(DeltaLogFileActionStats that) {
+        if (this.netRecords == null || that.netRecords == null) {
+          return new DeltaLogFileActionStats(null);
+        } else {
+          return new DeltaLogFileActionStats(this.netRecords + that.netRecords);
+        }
+      }
+
+      public long getNetRecords() {
+        if (this.netRecords != null) {
+          return this.netRecords;
+        } else {
+          return 0L;
+        }
+      }
+
     }
 
     private static JsonNode findNode(JsonNode node, String... paths) {

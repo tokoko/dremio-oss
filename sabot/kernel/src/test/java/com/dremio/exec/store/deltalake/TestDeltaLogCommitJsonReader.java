@@ -92,6 +92,15 @@ public class TestDeltaLogCommitJsonReader {
     }
 
     @Test
+    public void testCommitInfoStatsHasPerFileNumRecords() throws IOException {
+      DeltaLogSnapshot snapshot = parseCommitJson("/deltalake/jsonLog_onlyPerFileNumRecords.json");
+
+      assertEquals(0L, snapshot.getNetBytesAdded());
+      assertEquals(0L, snapshot.getNetFilesAdded());
+      assertEquals(1824L, snapshot.getNetOutputRows());
+    }
+
+    @Test
     public void testCommitInfoWithOpStats() throws IOException {
         DeltaLogSnapshot snapshot = parseCommitJson("/deltalake/test1_1.json");
 
